@@ -1,0 +1,35 @@
+# ===============================
+# CRITICAL: Secrets & Environment
+# ===============================
+.env
+.env.local
+*.env
+
+# ===============================
+# Virtual Environments & Dependencies
+# ===============================
+venv/
+env/
+ENV/
+.venv/
+
+# ===============================
+# Python Cache & Bytecode
+# ===============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ===============================
+# Jupyter Notebooks Cache
+# ===============================
+.ipynb_checkpoints/
+
+# ===============================
+# Operating System & Editor Files
+# ===============================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
