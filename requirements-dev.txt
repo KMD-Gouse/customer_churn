@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Local test runner. CI currently uses Python's built-in unittest runner.
+pytest==9.1.1

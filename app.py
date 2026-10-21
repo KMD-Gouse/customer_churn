@@ -25,6 +25,11 @@ import numpy as np
 import pandas as pd
 import shap
 import streamlit as st
+import matplotlib
+
+# Streamlit renders figures itself; a GUI backend can crash during automated
+# tests or in headless deployment environments such as CI and Docker.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from churn_utils import add_features, apply_calibration, build_explanation
