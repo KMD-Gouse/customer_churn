@@ -1,0 +1,21 @@
+.git
+.github
+.gitignore
+
+venv/
+venv_old/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Never include local credentials in the build context.
+.env
+.env.*
+
+# Training, development, and local-only files are not needed at runtime.
+*.ipynb
+*.csv
+test_*.py
+manual_llm_check.py
+pytest.ini
+requirements-dev.txt
