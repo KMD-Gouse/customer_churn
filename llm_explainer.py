@@ -5,16 +5,6 @@ import os
 # Load environment variables
 load_dotenv()
 
-# Get Gemini API key
-api_key = os.getenv("GEMINI_API_KEY")
-
-if not api_key:
-    raise ValueError("GEMINI_API_KEY not found in .env file")
-
-# Create Gemini client
-client = genai.Client(api_key=api_key)
-
-
 def generate_llm_explanation(explanation):
     """
     Converts the structured ML explanation into
@@ -81,6 +71,14 @@ non-technical business user to understand.
 """
 
     try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return (
+                "AI explanation is unavailable because GEMINI_API_KEY is not "
+                "configured. The churn prediction itself is unaffected."
+            )
+
+        client = genai.Client(api_key=api_key)
 
         response = client.models.generate_content(
             model="gemini-3.7-flash",

@@ -9,6 +9,7 @@
 # Virtual Environments & Dependencies
 # ===============================
 venv/
+venv_old/
 env/
 ENV/
 .venv/

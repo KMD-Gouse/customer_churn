@@ -19,15 +19,21 @@ Gemini LLM (only called when user clicks "Generate AI Explanation")
 Business-friendly explanation
 """
 
-import joblib
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import shap
 import streamlit as st
 import matplotlib.pyplot as plt
-from xgboost import XGBClassifier
 
-from explanation_engine import explain_customer
+from churn_utils import add_features, apply_calibration, build_explanation
+from app_support import (
+    ArtifactLoadError,
+    INTERNET_SERVICE_COLUMNS,
+    load_model_bundle,
+    validate_customer_input,
+)
 from llm_explainer import generate_llm_explanation
 
 
@@ -84,39 +90,40 @@ st.markdown(
 
 @st.cache_resource
 def load_artifacts():
+    artifact_dir = Path(__file__).resolve().parent / "artifacts"
+    pipeline, calibrator, config = load_model_bundle(artifact_dir)
+    preprocessor = pipeline.named_steps["preprocessor"]
+    xgb_model = pipeline.named_steps["model"]
+    try:
+        explainer = shap.TreeExplainer(xgb_model)
+    except Exception as exc:
+        raise ArtifactLoadError(
+            "The SHAP explainer could not be created from the saved model. "
+            "Regenerate the artifacts with the installed package versions."
+        ) from exc
+    return pipeline, calibrator, preprocessor, explainer, config
 
-    preprocessor = joblib.load("preprocessor.pkl")
 
-    xgb_model = XGBClassifier()
-    xgb_model.load_model("xgb_model.json")
-
-    feature_names = joblib.load("shap_feature_names.pkl")
-    threshold = joblib.load("business_threshold.pkl")
-    categorical_features = joblib.load("categorical_features.pkl")
-    numerical_features = joblib.load("numerical_features.pkl")
-
-    explainer = shap.TreeExplainer(xgb_model)
-
-    return (
+try:
+    (
+        pipeline,
+        calibrator,
         preprocessor,
-        xgb_model,
         explainer,
-        feature_names,
-        threshold,
-        categorical_features,
-        numerical_features
+        config,
+    ) = load_artifacts()
+except ArtifactLoadError as exc:
+    st.error("The churn model is currently unavailable.")
+    st.info(str(exc))
+    st.caption(
+        "Recovery: run churn_final_corrected.ipynb from beginning to end, "
+        "then restart this application."
     )
+    st.stop()
 
-
-(
-    preprocessor,
-    xgb_model,
-    explainer,
-    feature_names,
-    threshold,
-    categorical_features,
-    numerical_features
-) = load_artifacts()
+feature_names = config["shap_feature_names"]
+feature_mapping = config["feature_mapping"]
+threshold = float(config["threshold"])
 
 
 # ======================================================================
@@ -151,32 +158,11 @@ CATEGORICAL_OPTIONS = {
 # SHAP HELPER
 # ======================================================================
 
-def aggregate_shap_to_original_features(
-    shap_row,
-    feature_names,
-    categorical_features,
-    numerical_features
-):
-    mapping = {}
-
-    for col in numerical_features:
-        mapping[f"numerical__{col}"] = col
-
-    for col in categorical_features:
-        prefix = f"categorical__{col}_"
-        for fname in feature_names:
-            if fname.startswith(prefix):
-                mapping[fname] = col
-
-    contrib = pd.Series(shap_row, index=feature_names)
-
-    agg = {}
-    for original in set(mapping.values()):
-        cols = [f for f, o in mapping.items() if o == original]
-        agg[original] = contrib[cols].sum()
-
-    result = pd.Series(agg).sort_values(key=abs, ascending=False)
-    return result
+def aggregate_shap_to_original_features(shap_row, names, mapping):
+    contrib = pd.Series(shap_row, index=names)
+    return contrib.groupby(lambda name: mapping[name]).sum().sort_values(
+        key=abs, ascending=False
+    )
 
 
 # ======================================================================
@@ -209,7 +195,7 @@ with st.sidebar:
             "Total Charges ($)",
             0.0,
             10000.0,
-            float(input_data["MonthlyCharges"]) * max(input_data["tenure"], 1),
+            float(input_data["MonthlyCharges"]) * input_data["tenure"],
             step=10.0
         )
 
@@ -221,16 +207,30 @@ with st.sidebar:
 
     with st.expander("Services", expanded=False):
         input_data["PhoneService"] = st.selectbox("Phone Service", CATEGORICAL_OPTIONS["PhoneService"])
-        input_data["MultipleLines"] = st.selectbox("Multiple Lines", CATEGORICAL_OPTIONS["MultipleLines"])
+        phone_disabled = input_data["PhoneService"] == "No"
+        multiple_line_options = (
+            ["No phone service"] if phone_disabled else ["No", "Yes"]
+        )
+        input_data["MultipleLines"] = st.selectbox(
+            "Multiple Lines", multiple_line_options, disabled=phone_disabled
+        )
         input_data["InternetService"] = st.selectbox("Internet Service", CATEGORICAL_OPTIONS["InternetService"])
-        input_data["OnlineSecurity"] = st.selectbox("Online Security", CATEGORICAL_OPTIONS["OnlineSecurity"])
-        input_data["OnlineBackup"] = st.selectbox("Online Backup", CATEGORICAL_OPTIONS["OnlineBackup"])
-        input_data["DeviceProtection"] = st.selectbox("Device Protection", CATEGORICAL_OPTIONS["DeviceProtection"])
-        input_data["TechSupport"] = st.selectbox("Tech Support", CATEGORICAL_OPTIONS["TechSupport"])
-        input_data["StreamingTV"] = st.selectbox("Streaming TV", CATEGORICAL_OPTIONS["StreamingTV"])
-        input_data["StreamingMovies"] = st.selectbox("Streaming Movies", CATEGORICAL_OPTIONS["StreamingMovies"])
+        internet_disabled = input_data["InternetService"] == "No"
+        for field in INTERNET_SERVICE_COLUMNS:
+            options = ["No internet service"] if internet_disabled else ["No", "Yes"]
+            label = {
+                "OnlineSecurity": "Online Security",
+                "OnlineBackup": "Online Backup",
+                "DeviceProtection": "Device Protection",
+                "TechSupport": "Tech Support",
+                "StreamingTV": "Streaming TV",
+                "StreamingMovies": "Streaming Movies",
+            }[field]
+            input_data[field] = st.selectbox(
+                label, options, disabled=internet_disabled
+            )
 
-    predict_clicked = st.button("Predict Churn", type="primary", use_container_width=True)
+    predict_clicked = st.button("Predict Churn", type="primary", width="stretch")
 
 
 # ======================================================================
@@ -254,29 +254,53 @@ if "ai_explanation" not in st.session_state:
 # ======================================================================
 
 if predict_clicked:
-
-    ordered_cols = categorical_features + numerical_features
-    row = {col: input_data[col] for col in ordered_cols}
-    customer_df = pd.DataFrame([row])
-
-    customer_transformed = preprocessor.transform(customer_df)
-    proba = xgb_model.predict_proba(customer_transformed)[0, 1]
-    prediction = int(proba >= threshold)
-
-    shap_values = explainer.shap_values(customer_transformed)
-    shap_row = shap_values[0]
-
-    explanation = explain_customer(input_data)
-
-    st.session_state.result = {
-        "proba": proba,
-        "prediction": prediction,
-        "customer_transformed": customer_transformed,
-        "shap_row": shap_row,
-        "explanation": explanation,
-    }
-    # New prediction invalidates any previously generated AI explanation.
+    validation_errors, validation_warnings = validate_customer_input(
+        input_data, CATEGORICAL_OPTIONS
+    )
+    st.session_state.result = None
     st.session_state.ai_explanation = None
+
+    for warning in validation_warnings:
+        st.warning(warning)
+
+    if validation_errors:
+        st.error("Please correct the customer details before predicting:")
+        for error in validation_errors:
+            st.markdown(f"- {error}")
+    else:
+        try:
+            customer_df = add_features(pd.DataFrame([input_data]))[
+                config["input_columns"]
+            ]
+            customer_transformed = preprocessor.transform(customer_df)
+            raw_score = pipeline.predict_proba(customer_df)[:, 1]
+            risk_score = float(apply_calibration(calibrator, raw_score)[0])
+            prediction = int(risk_score >= threshold)
+
+            shap_values = np.asarray(explainer.shap_values(customer_transformed))
+            shap_row = shap_values[0]
+
+            explanation = build_explanation(
+                raw_row=customer_df.iloc[0],
+                score=risk_score,
+                threshold=threshold,
+                shap_row=shap_row,
+                names=feature_names,
+                mapping=feature_mapping,
+            )
+
+            st.session_state.result = {
+                "risk_score": risk_score,
+                "prediction": prediction,
+                "customer_transformed": customer_transformed,
+                "shap_row": shap_row,
+                "explanation": explanation,
+            }
+        except Exception:
+            st.error(
+                "The prediction could not be completed. Verify the customer "
+                "values and regenerate the model artifacts if the problem persists."
+            )
 
 
 if st.session_state.result is None:
@@ -284,7 +308,7 @@ if st.session_state.result is None:
     st.stop()
 
 result = st.session_state.result
-proba = result["proba"]
+risk_score = result["risk_score"]
 prediction = result["prediction"]
 customer_transformed = result["customer_transformed"]
 shap_row = result["shap_row"]
@@ -298,7 +322,7 @@ explanation = result["explanation"]
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    st.metric("Churn Probability", f"{proba:.1%}")
+    st.metric("Calibrated Churn Risk", f"{risk_score:.1%}")
     st.metric("Decision Threshold", f"{threshold:.0%}")
 
     if prediction == 1:
@@ -329,7 +353,7 @@ st.divider()
 st.subheader("Top Factors")
 
 agg = aggregate_shap_to_original_features(
-    shap_row, feature_names, categorical_features, numerical_features
+    shap_row, feature_names, feature_mapping
 )
 
 top = agg.head(8).reset_index()
@@ -340,7 +364,7 @@ top["Effect"] = np.where(
 
 st.dataframe(
     top,
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     column_config={
         "SHAP Contribution": st.column_config.NumberColumn(format="%.3f")
@@ -365,13 +389,19 @@ factor_col1, factor_col2 = st.columns(2)
 
 with factor_col1:
     st.markdown("**🔴 Factors Increasing Churn**")
-    for factor in explanation["top_churn_factors"]:
-        st.markdown(f"<div class='factor-line'>• {factor}</div>", unsafe_allow_html=True)
+    for factor in explanation["top_factors_increasing"]:
+        st.markdown(
+            f"<div class='factor-line'>• {factor['factor']} ({factor['strength']})</div>",
+            unsafe_allow_html=True,
+        )
 
 with factor_col2:
     st.markdown("**🟢 Factors Reducing Churn**")
-    for factor in explanation["protective_factors"]:
-        st.markdown(f"<div class='factor-line'>• {factor}</div>", unsafe_allow_html=True)
+    for factor in explanation["top_factors_reducing"]:
+        st.markdown(
+            f"<div class='factor-line'>• {factor['factor']} ({factor['strength']})</div>",
+            unsafe_allow_html=True,
+        )
 
 st.divider()
 
@@ -384,18 +414,11 @@ st.divider()
 
 st.subheader("🤖 AI Business Explanation")
 
-generate_clicked = st.button("Generate AI Explanation", use_container_width=False)
+generate_clicked = st.button("Generate AI Explanation", width="content")
 
 if generate_clicked:
-    llm_input = {
-        "prediction": "CHURN" if explanation["prediction"] == 1 else "STAY",
-        "probability": explanation["probability"],
-        "threshold": explanation["business_threshold"],
-        "top_factors_increasing": explanation["top_churn_factors"],
-        "top_factors_reducing": explanation["protective_factors"]
-    }
     with st.spinner("Generating AI explanation..."):
-        st.session_state.ai_explanation = generate_llm_explanation(llm_input)
+        st.session_state.ai_explanation = generate_llm_explanation(explanation)
 
 if st.session_state.ai_explanation:
     st.markdown(st.session_state.ai_explanation)
